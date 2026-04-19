@@ -68,6 +68,10 @@ abstract class LogEntryDao {
      */
     @Transaction
     open suspend fun insertAndEnforceLimit(entity: LogEntryEntity, maxCount: Int) {
+        // Bug Hunt R02 M2 fix — 음수 maxCount 방어. 음수면 excess 가 양수가 되어
+        // deleteOldest(양수) 호출 → SQL LIMIT 음수("제한 없음")로 의도와 다른 삭제 위험.
+        // 라이브러리 공개 API 진입에서 require 로 차단.
+        require(maxCount >= 0) { "maxCount must be non-negative, was $maxCount" }
         insert(entity)
         val count = countAll()
         val excess = (count - maxCount).coerceAtLeast(0L).toInt()

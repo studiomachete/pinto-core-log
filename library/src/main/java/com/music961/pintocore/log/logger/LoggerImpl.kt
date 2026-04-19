@@ -30,6 +30,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
@@ -97,9 +98,18 @@ class LoggerImpl @Inject constructor(
         //    Flow 구독 시작 전 event() 호출이 들어오면 _consent 가 기본값(identifiedConsent=false)
         //    상태로 남아 있어 이미 동의한 사용자의 첫 이벤트가 익명으로 기록되는 윈도우가 발생.
         //    Singleton 생성 시 1회만 호출 → 앱 시작 시점 미세 지연만 발생.
-        runCatching {
-            runBlocking { consentStore.consent.first() }
-        }.getOrNull()?.let { _consent.value = it }
+        //
+        //    Bug Hunt R02 C2 fix — runBlocking 에 [CAPTURE_TIMEOUT_MS] 타임아웃 가드.
+        //    DataStore 가 느려 응답 안 오면 ANR 위험. 타임아웃 시 기본값 유지하고
+        //    아래 launchIn 의 비동기 구독이 첫 emit 도착 시 _consent 를 갱신한다.
+        val captured = runCatching {
+            runBlocking {
+                withTimeoutOrNull(CAPTURE_TIMEOUT_MS) {
+                    consentStore.consent.first()
+                }
+            }
+        }.getOrNull()
+        if (captured != null) _consent.value = captured
 
         // 1) consent 변화 관찰 — 캐시 + 동의 철회 훅
         consentStore.consent
@@ -286,6 +296,14 @@ class LoggerImpl @Inject constructor(
     companion object {
         /** 로컬 버퍼 상한. 초과 시 오래된 것부터 drop. */
         const val BUFFER_MAX_COUNT = 5_000
+
+        /**
+         * init 시점 동의 값 동기 캡처 타임아웃 (ms).
+         *
+         * Bug Hunt R02 C2 fix — 초과 시 기본값 유지하고 비동기 launchIn 이 첫 emit 도착 시 갱신.
+         * 첫 ~수백ms 윈도우의 이벤트는 익명(userId=null)으로 기록될 수 있으나 ANR 보다 안전.
+         */
+        const val CAPTURE_TIMEOUT_MS = 500L
     }
 }
 

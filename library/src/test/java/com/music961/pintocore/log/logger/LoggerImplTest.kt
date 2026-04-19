@@ -18,9 +18,11 @@ import dagger.Lazy
 import io.mockk.coEvery
 import io.mockk.mockk
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
@@ -438,6 +440,113 @@ class LoggerImplTest {
         // 가장 오래된 것부터 지워졌으므로 마지막 maxCount 개가 남아 있다.
         val remaining = store.keys.toSet()
         assertEquals(setOf("id-8", "id-9", "id-10"), remaining)
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Bug Hunt R02 신규 회귀 테스트 (C2 + M2)
+    // ─────────────────────────────────────────────────────────
+
+    /**
+     * R02 C2 — init 시점 DataStore 응답이 [LoggerImpl.CAPTURE_TIMEOUT_MS] 보다 늦어도
+     * runBlocking 이 ANR 없이 빠져나오고 LoggerImpl 가 정상 생성된다.
+     *
+     * 검증:
+     *  1. LoggerImpl 생성이 1.5초보다 훨씬 빨리 끝남 (= timeout 가드 동작).
+     *  2. 생성 직후 _consent 는 기본값 (capture 실패).
+     *  3. delay 종료 후 launchIn 의 비동기 구독이 첫 emit 을 받아 _consent 갱신.
+     */
+    @Test
+    fun `R02_C2 - init 시 DataStore 가 1_5초 응답 안 해도 ANR 없이 생성됨 + 비동기 갱신`() = runTest {
+        val target = LogConsent(identifiedConsent = true, wifiOnlyUpload = true, askedOnce = true)
+
+        // 1.5 초 후에야 emit 하는 느린 LogConsentStore.
+        val slowStore = object : LogConsentStore {
+            override val consent: Flow<LogConsent> = flow {
+                delay(1_500L)
+                emit(target)
+            }
+            override suspend fun setIdentifiedConsent(v: Boolean) {}
+            override suspend fun setWifiOnly(v: Boolean) {}
+            override suspend fun markAsked() {}
+            override suspend fun setConsentAndMarkAsked(allow: Boolean) {}
+        }
+
+        val dao = mockk<LogEntryDao>(relaxed = true)
+        val deviceInfo = mockk<DeviceInfoProvider>()
+        io.mockk.every { deviceInfo.info } returns fakeDeviceInfo()
+        val deviceHash = mockk<DeviceHashProvider>()
+        coEvery { deviceHash.get() } returns "testhash"
+
+        // 1) 생성이 ANR 없이 빠르게 (CAPTURE_TIMEOUT_MS + 여유) 끝나는지 측정.
+        //    runBlocking 가드 없으면 1.5초 가까이 블록될 것.
+        val startMs = System.currentTimeMillis()
+        val logger = LoggerImpl(
+            daoLazy = Lazy { dao },
+            consentStore = slowStore,
+            deviceInfoProvider = deviceInfo,
+            deviceHashProvider = deviceHash,
+            sessionIdHolder = SessionIdHolder(),
+            userIdProvider = FakeUserIdProvider("u1"),
+            errorReporter = FakeErrorReporter(),
+            appId = "pinto",
+            appVersion = "1.0.0-test",
+        )
+        val elapsedMs = System.currentTimeMillis() - startMs
+
+        // CAPTURE_TIMEOUT_MS=500ms 가드 + 약간의 오버헤드 → 1.0초 내로 반환되어야 한다.
+        assertTrue(
+            "init 가 timeout 가드로 1초 내 반환되어야 함 (실제 ${elapsedMs}ms)",
+            elapsedMs < 1_000L,
+        )
+
+        // 2) capture 실패 → _consent 는 기본값.
+        assertEquals(LogConsent.기본값, logger.consentState.value)
+
+        // 3) launchIn 비동기 구독이 첫 emit 도착 시 _consent 갱신.
+        //    실제 wallclock 으로 1.5초 + 여유 폴링 (LoggerImpl 내부 scope 는 Dispatchers.IO 사용).
+        val deadline = System.currentTimeMillis() + 3_500L
+        while (logger.consentState.value != target && System.currentTimeMillis() < deadline) {
+            Thread.sleep(50)
+        }
+        assertEquals(
+            "비동기 구독이 emit 도착 시 _consent 를 target 으로 갱신해야 함",
+            target,
+            logger.consentState.value,
+        )
+    }
+
+    /**
+     * R02 M2 — LogEntryDao.insertAndEnforceLimit 에 음수 maxCount 전달 시 IllegalArgumentException.
+     *
+     * 라이브러리 공개 API 방어 가드 회귀.
+     */
+    @Test
+    fun `R02_M2 - insertAndEnforceLimit maxCount 음수면 IllegalArgumentException`() = runTest {
+        val dao = object : LogEntryDao() {
+            override suspend fun insert(entity: LogEntryEntity) {}
+            override suspend fun insertAll(list: List<LogEntryEntity>) {}
+            override suspend fun countAll(): Long = 0L
+            override suspend fun oldestBatch(limit: Int): List<LogEntryEntity> = emptyList()
+            override suspend fun deleteByIds(ids: List<String>) {}
+            override suspend fun incrementRetry(ids: List<String>) {}
+            override suspend fun dropOverRetry(maxRetry: Int): Int = 0
+            override suspend fun deleteOldest(deleteCount: Int): Int = 0
+            override suspend fun getPendingEntries(): List<LogEntryEntity> = emptyList()
+            override suspend fun updateRecordJson(id: String, json: String) {}
+        }
+
+        val entity = LogEntryEntity(id = "x", recordJson = "{}", createdAt = 0L)
+        var threw = false
+        try {
+            dao.insertAndEnforceLimit(entity, -1)
+        } catch (e: IllegalArgumentException) {
+            threw = true
+            assertTrue(
+                "에러 메시지에 음수 값 포함",
+                e.message?.contains("-1") == true,
+            )
+        }
+        assertTrue("음수 maxCount 시 IllegalArgumentException 던져야 함", threw)
     }
 
     /** IO 디스패처 완료 대기 폴링. */
