@@ -37,16 +37,18 @@ abstract class LogEntryDao {
     abstract suspend fun dropOverRetry(maxRetry: Int): Int
 
     /**
-     * 버퍼 상한. [maxCount] 초과 시 오래된 것부터 삭제.
-     * Room은 LIMIT/OFFSET이 있는 서브쿼리 DELETE를 지원하므로 subquery로 처리.
+     * 오래된 순 [deleteCount] 개 삭제.
+     *
+     * Bug Hunt R01 B10 fix — 기존 `deleteOverLimit` 의 SQL `MAX(0, COUNT - :maxCount)` 서브쿼리는
+     * SQLite 의 MAX 집계 함수와 스칼라 함수 우선순위가 헷갈리는 안티패턴이었음. 카운트/초과분 계산을
+     * Kotlin 측 [insertAndEnforceLimit] 에서 처리하고, 이 쿼리는 단순 LIMIT 삭제만 담당.
      */
     @Query(
         """DELETE FROM log_entries WHERE id IN (
-            SELECT id FROM log_entries ORDER BY createdAt ASC
-            LIMIT MAX(0, (SELECT COUNT(*) FROM log_entries) - :maxCount)
+            SELECT id FROM log_entries ORDER BY createdAt ASC LIMIT :deleteCount
         )"""
     )
-    abstract suspend fun deleteOverLimit(maxCount: Int): Int
+    abstract suspend fun deleteOldest(deleteCount: Int): Int
 
     /** 동의 철회 훅 — 아직 업로드 안 된 레코드 전체 조회 */
     @Query("SELECT * FROM log_entries")
@@ -58,13 +60,17 @@ abstract class LogEntryDao {
     /**
      * 버퍼 insert 와 상한 초과분 삭제를 **원자적**으로 수행 (bug #6 fix).
      *
-     * 기존 [insert] + [deleteOverLimit] 순차 호출은 두 호출 사이 race 로
+     * 기존 [insert] + 삭제 쿼리 순차 호출은 두 호출 사이 race 로
      * 순간적으로 maxCount+1 상태가 노출되고, 다른 스레드의 삭제가 방금 넣은
      * 항목을 가져갈 여지가 있었음. @Transaction 로 단일 트랜잭션 보장.
+     *
+     * Bug Hunt R01 B10 fix — 카운트/초과분 계산을 Kotlin 측에서 수행 (deleteOldest 는 단순 LIMIT 삭제).
      */
     @Transaction
     open suspend fun insertAndEnforceLimit(entity: LogEntryEntity, maxCount: Int) {
         insert(entity)
-        deleteOverLimit(maxCount)
+        val count = countAll()
+        val excess = (count - maxCount).coerceAtLeast(0L).toInt()
+        if (excess > 0) deleteOldest(excess)
     }
 }

@@ -16,6 +16,7 @@ import com.music961.pintocore.log.transport.LogUploadWorker
 import dagger.hilt.android.qualifiers.ApplicationContext
 import timber.log.Timber
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -42,7 +43,13 @@ class LogForegroundTrigger @Inject constructor(
     /** 테스트 주입 가능한 now 공급자. Default 는 [System.currentTimeMillis]. */
     internal var nowProvider: () -> Long = { System.currentTimeMillis() }
 
+    /** Bug Hunt R01 A4 fix — attach() 중복 호출 가드. ProcessLifecycle 옵저버 중복 등록 방지. */
+    private val attached = AtomicBoolean(false)
+
     fun attach() {
+        // Bug Hunt R01 A4 fix — 이미 attach 된 상태면 즉시 리턴 (멱등 보장).
+        if (!attached.compareAndSet(false, true)) return
+
         // 주기 업로드 PeriodicWork 최초 등록 (KEEP — 이미 있으면 유지)
         val periodic = PeriodicWorkRequestBuilder<LogUploadWorker>(
             PERIODIC_INTERVAL_MIN, TimeUnit.MINUTES

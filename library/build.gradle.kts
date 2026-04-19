@@ -47,6 +47,12 @@ kotlin {
     }
 }
 
+// Bug Hunt R01 A3 fix — Room schema 를 라이브러리 자체 schemas 디렉토리로 export.
+// PintoLogDatabase exportSchema=true 와 짝.
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
+}
+
 dependencies {
     // AWS SDK BOM (pinto-core-aws 가 api 로 노출하는 dynamodb 등 transitive 버전 정합)
     implementation(platform("aws.sdk.kotlin:bom:1.6.57"))
@@ -92,6 +98,7 @@ dependencies {
     testImplementation("androidx.test.ext:junit:1.3.0")
     testImplementation("org.robolectric:robolectric:4.16")
     testImplementation("io.mockk:mockk:1.14.9")
+    testImplementation("androidx.work:work-testing:2.11.2")
 }
 
 // GitHub Packages 배포 설정
@@ -100,7 +107,7 @@ publishing {
         register<MavenPublication>("release") {
             groupId = "com.music961"
             artifactId = "pinto-core-log"
-            version = "0.1.0"
+            version = "0.1.1"
 
             afterEvaluate {
                 from(components["release"])

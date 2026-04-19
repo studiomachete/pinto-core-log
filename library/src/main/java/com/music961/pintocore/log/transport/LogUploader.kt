@@ -21,6 +21,7 @@ import timber.log.Timber
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.uuid.Uuid
@@ -58,7 +59,8 @@ class LogUploader @Inject constructor(
     private var windowStartMs: Long = 0L
     private var windowCount: Int = 0
 
-    @Volatile private var mutationsDisabledReported: Boolean = false
+    // Bug Hunt R01 A5 fix — read-modify-write 원자성 보장 (compareAndSet).
+    private val mutationsDisabledReported = AtomicBoolean(false)
 
     /**
      * 업로드 1회 시도.
@@ -87,7 +89,7 @@ class LogUploader @Inject constructor(
             return@runCatching 0
         }
 
-        if (mutationsDisabledReported) {
+        if (mutationsDisabledReported.get()) {
             return@runCatching 0
         }
 
@@ -106,7 +108,14 @@ class LogUploader @Inject constructor(
                 reportOversized(bytes)
                 continue
             }
-            val item = runCatching { e.toDynamoItem() }.getOrNull()
+            // Bug Hunt R01 B5 fix — toDynamoItem 캐스팅/파싱 실패 시 errorReporter 보고.
+            val item = runCatching { e.toDynamoItem() }
+                .onFailure { t ->
+                    runCatching {
+                        errorReporter.report(t, "log_dynamo_item_drop id=${e.id}")
+                    }
+                }
+                .getOrNull()
             if (item == null) {
                 overSized.add(e.id) // 파싱 실패도 drop
                 continue
@@ -127,8 +136,8 @@ class LogUploader @Inject constructor(
             if (msg.contains("mutations disabled", ignoreCase = true) ||
                 msg.contains("mutationsEnabled", ignoreCase = true)
             ) {
-                if (!mutationsDisabledReported) {
-                    mutationsDisabledReported = true
+                // Bug Hunt R01 A5 fix — compareAndSet 으로 errorReporter.log 1회만 호출.
+                if (mutationsDisabledReported.compareAndSet(false, true)) {
                     runCatching {
                         errorReporter.log("log_upload_mutations_disabled: $msg")
                     }
@@ -146,7 +155,16 @@ class LogUploader @Inject constructor(
             return@runCatching result.accepted
         }
         // unprocessed 원본 맵 → recover id 매칭 (id 는 item map 의 "logEntryId")
-        val unprocessedIds = result.unprocessed.mapNotNull { it["logEntryId"] as? String }.toSet()
+        // Bug Hunt R01 B4 fix — logEntryId 누락 시 silent skip 대신 errorReporter 보고.
+        val unprocessedIds = result.unprocessed.mapNotNull { item ->
+            val id = item["logEntryId"] as? String
+            if (id == null) {
+                runCatching {
+                    errorReporter.log("log_upload_unprocessed_missing_id: keys=${item.keys}")
+                }
+            }
+            id
+        }.toSet()
         val successIds = accepted.filter { it !in unprocessedIds }
         if (successIds.isNotEmpty()) dao.deleteByIds(successIds)
         if (unprocessedIds.isNotEmpty()) {

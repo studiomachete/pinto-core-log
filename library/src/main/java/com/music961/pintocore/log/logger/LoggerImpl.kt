@@ -23,9 +23,11 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
@@ -91,6 +93,14 @@ class LoggerImpl @Inject constructor(
     private val enqueueMutex = Mutex()
 
     init {
+        // 0) Bug Hunt R01 A2 fix — 첫 동의 값을 동기적으로 캡처.
+        //    Flow 구독 시작 전 event() 호출이 들어오면 _consent 가 기본값(identifiedConsent=false)
+        //    상태로 남아 있어 이미 동의한 사용자의 첫 이벤트가 익명으로 기록되는 윈도우가 발생.
+        //    Singleton 생성 시 1회만 호출 → 앱 시작 시점 미세 지연만 발생.
+        runCatching {
+            runBlocking { consentStore.consent.first() }
+        }.getOrNull()?.let { _consent.value = it }
+
         // 1) consent 변화 관찰 — 캐시 + 동의 철회 훅
         consentStore.consent
             .onEach { next ->
@@ -112,7 +122,8 @@ class LoggerImpl @Inject constructor(
         val startedAt = System.currentTimeMillis()
         return object : PerfSpan {
             override fun end(extra: Map<LogPayloadKey, Any?>) {
-                val elapsed = System.currentTimeMillis() - startedAt
+                // Bug Hunt R01 B3 fix — clock skew/시스템 시간 역행 시 음수 방지.
+                val elapsed = (System.currentTimeMillis() - startedAt).coerceAtLeast(0L)
                 enqueue(
                     event = event,
                     category = LogCategory.performance.name,
@@ -175,9 +186,13 @@ class LoggerImpl @Inject constructor(
         payload: Map<LogPayloadKey, Any?>,
         durationMs: Long?,
     ): LogRecord {
+        // Bug Hunt R01 B2 fix — 함수 진입 시점 동의 스냅샷.
+        // 함수 실행 중간에 _consent 가 변해도 단일 레코드의 식별 결정은 일관성 유지.
+        val consent = _consent.value
         val deviceHash = deviceHashProvider.get()
-        val userId = if (_consent.value.identifiedConsent) {
-            userIdProvider.currentUserId()
+        // Bug Hunt R01 (마리사#2) — currentUserId 가 빈 문자열을 반환해도 null 처리.
+        val userId = if (consent.identifiedConsent) {
+            userIdProvider.currentUserId()?.takeIf { it.isNotBlank() }
         } else null
 
         return LogRecord(

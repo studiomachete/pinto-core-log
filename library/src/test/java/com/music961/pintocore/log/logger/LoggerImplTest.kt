@@ -356,6 +356,90 @@ class LoggerImplTest {
         assertNull("Mutex 로 insert ↔ nullify 직렬화 → userId 가 null 이어야 함", record.userId)
     }
 
+    // ─────────────────────────────────────────────────────────
+    // Bug Hunt R01 추가 회귀 테스트
+    // ─────────────────────────────────────────────────────────
+
+    /** R01 B3 fix — perfStart end() 호출 시 시스템 시간이 역행해도 durationMs 는 음수가 아니다. */
+    @Test
+    fun `R01_B3 - perfStart end 시 durationMs 는 0 이상`() = runTest {
+        val captured = java.util.concurrent.atomic.AtomicReference<LogEntryEntity?>()
+        val dao = mockk<LogEntryDao>(relaxed = true)
+        coEvery { dao.insertAndEnforceLimit(any(), any()) } answers { captured.set(firstArg()) }
+
+        val (logger, _) = newLogger(
+            consent = LogConsent(identifiedConsent = false, wifiOnlyUpload = false, askedOnce = true),
+            userId = null,
+            dao = dao,
+        )
+
+        // perfStart → end 사이에 시스템 시간이 역행하는 케이스를 직접 시뮬레이션 하기는 어려우므로
+        // perfStart 내부 startedAt 을 잡은 직후 즉시 end() 호출. 이때도 durationMs 는 음수면 안 된다.
+        val span = logger.perfStart(TestEvent.SCREEN_ENTER_HOME)
+        span.end()
+
+        awaitNotNull { captured.get() }
+        val record = json.decodeFromString(LogRecord.serializer(), captured.get()!!.recordJson)
+        val dur = record.durationMs
+        assertTrue("durationMs 는 0 이상이어야 함 (실제값=$dur)", dur != null && dur >= 0L)
+    }
+
+    /**
+     * R01 B10 fix — insertAndEnforceLimit 가 maxCount 초과 시 정확히 maxCount 만 남도록 동작.
+     * In-memory 가짜 dao 로 카운트 검증.
+     */
+    @Test
+    fun `R01_B10 - insertAndEnforceLimit 호출 시 maxCount 만 유지`() = runTest {
+        // in-memory store 시뮬레이션. countAll/deleteOldest 가 LogEntryDao 의 실제 호출 패턴을 모방.
+        val store = java.util.concurrent.ConcurrentHashMap<String, LogEntryEntity>()
+        val dao = object : LogEntryDao() {
+            override suspend fun insert(entity: LogEntryEntity) {
+                store[entity.id] = entity
+            }
+            override suspend fun insertAll(list: List<LogEntryEntity>) {
+                list.forEach { store[it.id] = it }
+            }
+            override suspend fun countAll(): Long = store.size.toLong()
+            override suspend fun oldestBatch(limit: Int): List<LogEntryEntity> =
+                store.values.sortedBy { it.createdAt }.take(limit)
+            override suspend fun deleteByIds(ids: List<String>) {
+                ids.forEach { store.remove(it) }
+            }
+            override suspend fun incrementRetry(ids: List<String>) {
+                ids.forEach { id ->
+                    store[id]?.let { store[id] = it.copy(retryCount = it.retryCount + 1) }
+                }
+            }
+            override suspend fun dropOverRetry(maxRetry: Int): Int {
+                val toRemove = store.values.filter { it.retryCount >= maxRetry }.map { it.id }
+                toRemove.forEach { store.remove(it) }
+                return toRemove.size
+            }
+            override suspend fun deleteOldest(deleteCount: Int): Int {
+                val toRemove = store.values.sortedBy { it.createdAt }.take(deleteCount).map { it.id }
+                toRemove.forEach { store.remove(it) }
+                return toRemove.size
+            }
+            override suspend fun getPendingEntries(): List<LogEntryEntity> = store.values.toList()
+            override suspend fun updateRecordJson(id: String, json: String) {
+                store[id]?.let { store[id] = it.copy(recordJson = json) }
+            }
+        }
+
+        val maxCount = 3
+        for (i in 1..10) {
+            dao.insertAndEnforceLimit(
+                LogEntryEntity(id = "id-$i", recordJson = "{}", createdAt = i.toLong()),
+                maxCount,
+            )
+        }
+
+        assertEquals("정확히 maxCount 만 남아야 함", maxCount.toLong(), dao.countAll())
+        // 가장 오래된 것부터 지워졌으므로 마지막 maxCount 개가 남아 있다.
+        val remaining = store.keys.toSet()
+        assertEquals(setOf("id-8", "id-9", "id-10"), remaining)
+    }
+
     /** IO 디스패처 완료 대기 폴링. */
     private fun awaitNotNull(timeoutMs: Long = 2_000L, predicate: () -> Any?) {
         val deadline = System.currentTimeMillis() + timeoutMs

@@ -1,13 +1,19 @@
 package com.music961.pintocore.log.transport
 
+import com.music961.pintocore.aws.BatchWriteItemResult
 import com.music961.pintocore.aws.PintoAWS
+import com.music961.pintocore.aws.PintoAWSLocal
+import com.music961.pintocore.aws.dynamoBatchWriteItem
 import com.music961.pintocore.log.api.LogErrorReporter
 import com.music961.pintocore.log.consent.LogConsent
 import com.music961.pintocore.log.consent.LogConsentStore
 import com.music961.pintocore.log.storage.LogEntryDao
 import com.music961.pintocore.log.storage.LogEntryEntity
+import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.mockk
+import io.mockk.mockkStatic
+import io.mockk.unmockkStatic
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -139,6 +145,97 @@ class LogUploaderTest {
         )
         val item = uploader.debugToDynamoItem(entity)
         assertEquals("2024-01-01", item["pk"])
+    }
+
+    /**
+     * Bug Hunt R01 A5 fix — mutationsDisabled 응답을 두 번 받아도 errorReporter.log 는 1회만 호출.
+     * 첫 호출에서 보고하고, 두 번째 호출은 즉시 0 반환하므로 dynamoBatchWriteItem 도 1번만 호출된다.
+     */
+    @Test
+    fun `R01_A5 - mutationsDisabled 두 번 받아도 errorReporter log 1회만 호출`() = runTest {
+        mockkStatic("com.music961.pintocore.aws.DynamoBatchWriteKt")
+        try {
+            val dao = mockk<LogEntryDao>(relaxed = true)
+            // 배치 1건 반환 (BatchWrite 진입 조건 만족)
+            coEvery { dao.oldestBatch(any()) } returns listOf(
+                LogEntryEntity(
+                    id = "id-1",
+                    recordJson = """{"eventName":"X","timestamp":1735689600000}""",
+                    createdAt = 1735689600000L,
+                ),
+            )
+            val aws = mockk<PintoAWS>(relaxed = true)
+            // dynamoBatchWriteItem 가 mutationsEnabled 거절 예외 던지도록.
+            coEvery {
+                aws.dynamoBatchWriteItem(any(), any(), any(), any())
+            } returns Result.failure(IllegalStateException("mutations disabled for BatchWriteItem"))
+
+            val consent = FakeConsentStore(
+                LogConsent(identifiedConsent = false, wifiOnlyUpload = false, askedOnce = true),
+            )
+            val reporter = FakeErrorReporter()
+            val uploader = LogUploader(
+                dao, aws, consent, stubNetMonitor(NetworkMonitor.Type.WIFI), reporter,
+            )
+
+            val r1 = uploader.upload()
+            val r2 = uploader.upload()
+
+            assertEquals(0, r1.getOrNull())
+            assertEquals(0, r2.getOrNull())
+            // mutationsDisabled 보고는 첫 호출 시 1회만.
+            val disabledLogs = reporter.logs.filter { it.contains("log_upload_mutations_disabled") }
+            assertEquals("mutationsDisabled 보고는 1회만", 1, disabledLogs.size)
+            // 두 번째 호출은 mutationsDisabledReported 가드로 dynamoBatchWriteItem 까지 가지 않음.
+            coVerify(exactly = 1) { aws.dynamoBatchWriteItem(any(), any(), any(), any()) }
+        } finally {
+            unmockkStatic("com.music961.pintocore.aws.DynamoBatchWriteKt")
+        }
+    }
+
+    /**
+     * Bug Hunt R01 B4 fix — unprocessed item 에 logEntryId 가 누락되면 errorReporter.log 호출.
+     */
+    @Test
+    fun `R01_B4 - unprocessed 에 logEntryId 없으면 errorReporter log 호출`() = runTest {
+        mockkStatic("com.music961.pintocore.aws.DynamoBatchWriteKt")
+        try {
+            val dao = mockk<LogEntryDao>(relaxed = true)
+            coEvery { dao.oldestBatch(any()) } returns listOf(
+                LogEntryEntity(
+                    id = "id-1",
+                    recordJson = """{"eventName":"X","timestamp":1735689600000}""",
+                    createdAt = 1735689600000L,
+                ),
+            )
+            val aws = mockk<PintoAWS>(relaxed = true)
+            // unprocessed 에 logEntryId 키가 없는 맵 반환 (시뮬: 손상된 응답).
+            coEvery {
+                aws.dynamoBatchWriteItem(any(), any(), any(), any())
+            } returns Result.success(
+                BatchWriteItemResult(
+                    accepted = 0,
+                    unprocessed = listOf(mapOf("pk" to "2025-01-01", "sk" to "abc")),
+                ),
+            )
+
+            val consent = FakeConsentStore(
+                LogConsent(identifiedConsent = false, wifiOnlyUpload = false, askedOnce = true),
+            )
+            val reporter = FakeErrorReporter()
+            val uploader = LogUploader(
+                dao, aws, consent, stubNetMonitor(NetworkMonitor.Type.WIFI), reporter,
+            )
+
+            uploader.upload()
+
+            val missingLogs = reporter.logs.filter {
+                it.contains("log_upload_unprocessed_missing_id")
+            }
+            assertEquals("unprocessed missing logEntryId 보고는 1회", 1, missingLogs.size)
+        } finally {
+            unmockkStatic("com.music961.pintocore.aws.DynamoBatchWriteKt")
+        }
     }
 
     @Test

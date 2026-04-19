@@ -25,11 +25,16 @@ class DeviceInfoProvider @Inject constructor(
     val info: DeviceInfo by lazy { compute() }
 
     private fun compute(): DeviceInfo {
+        // Bug Hunt R01 B6 fix — ActivityManager null 시 ramMb=0 이 정상 데이터로 오인되지 않도록
+        // -1L 을 "측정 불가" 마커로 사용. (DeviceInfo.ramMb 는 non-null Long.)
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
-        val memInfo = ActivityManager.MemoryInfo().also {
-            am?.getMemoryInfo(it)
+        val ramMb: Long = if (am == null) {
+            -1L
+        } else {
+            val memInfo = ActivityManager.MemoryInfo()
+            am.getMemoryInfo(memInfo)
+            memInfo.totalMem / (1024L * 1024L)
         }
-        val ramMb = memInfo.totalMem / (1024L * 1024L)
 
         val cfg: Configuration = context.resources.configuration
         val screenDp = "${cfg.screenWidthDp} x ${cfg.screenHeightDp}"

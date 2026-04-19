@@ -16,10 +16,13 @@ import androidx.room.RoomDatabase
  *
  * @since pinto-core-log 0.1.0
  */
+// Bug Hunt R01 A3 fix — exportSchema=true 로 변경.
+// 메인 앱이 ksp room.schemaLocation arg 를 강제하면 라이브러리도 자체 schemas 디렉토리로 export 해야
+// KSP 충돌이 사라진다. library/build.gradle.kts 에 ksp { arg("room.schemaLocation", ...) } 추가됨.
 @Database(
     entities = [LogEntryEntity::class],
     version = 1,
-    exportSchema = false,
+    exportSchema = true,
 )
 abstract class PintoLogDatabase : RoomDatabase() {
     abstract fun logEntryDao(): LogEntryDao
