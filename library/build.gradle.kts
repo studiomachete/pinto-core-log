@@ -107,7 +107,7 @@ publishing {
         register<MavenPublication>("release") {
             groupId = "com.music961"
             artifactId = "pinto-core-log"
-            version = "0.1.2"
+            version = "0.1.3"
 
             afterEvaluate {
                 from(components["release"])

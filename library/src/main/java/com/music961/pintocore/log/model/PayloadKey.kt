@@ -33,6 +33,7 @@ enum class PayloadKey(override val key: String) : LogPayloadKey {
 
     // 사용자 활동
     TARGET_USER_ID("targetUserId"),     // 팔로우/신고 대상
+    USER_ID("userId"),                  // 호출자가 명시 캡처할 userId (USER_LOGOUT 등 RepoState 변경 race 회피용). payload 는 nested map 으로 저장되므로 top-level userId 와 충돌 없음.
     REPORT_REASON("reportReason"),      // 신고 사유 코드 (자유 텍스트 금지)
     COMMENT_LENGTH("commentLength"),    // 댓글 길이 (본문 금지)
 
